@@ -7,64 +7,84 @@
 #include "SPI.h"
 #include <Wire.h>
 
+#include "BSP_Button.h"
+#include "App_HMI.h"
+
 // ==========================================
 // 1. 硬件引脚与网络配置
 // ==========================================
-const char* ssid = "YOUR_WIFI_SSID";       // 替换为你的 Wi-Fi 名称
-const char* password = "YOUR_WIFI_PASS";   // 替换为你的 Wi-Fi 密码
-const char* udpAddress = "192.168.1.100";  // 替换为上位机电脑的局域网 IP
-const int udpPort = 8080;                  // 替换为上位机监听的 UDP 端口
+const char* ssid = "DDWW_Nwpu";           
+const char* password = "acq902m3";       
+const char* udpAddress = "192.168.0.103"; 
+const int udpPort = 6500;                 
+
+extern const uint32_t UART_BAUD_RATE = 115200; 
 
 const int LED_SYS  = 15;  
-const int LED_STAT = 16; 
+const int LED_STAT = 16;  
 const int I2C_SDA  = 1;   
 const int I2C_SCL  = 2;   
 const int SD_CS    = 10; 
 const int SD_MOSI  = 11; 
 const int SD_SCK   = 12; 
 const int SD_MISO  = 13; 
-const int UART_RX  = 18;  // H743 TX 连接至此
-const int UART_TX  = 17;  // H743 RX 连接至此
+const int UART_RX  = 18;  
+const int UART_TX  = 17;  
+const int SD_CD    = 8;   
 
 // ==========================================
 // 2. 核心数据结构与全局变量
 // ==========================================
-#define CHUNK_SIZE 512  // 每次搬运的最大数据块大小 (字节)
+#define CHUNK_SIZE 1024  
 
 typedef struct {
-  uint16_t length;             // 当前块实际装了多少字节
-  uint8_t payload[CHUNK_SIZE]; // 纯净的字节流容器
+  uint16_t length;             
+  uint8_t payload[CHUNK_SIZE]; 
 } LogChunk_t;
+
+// 🌟 新增：256 字节结构化二进制文件头
+#define HEADER_SIZE 256
+#define MAGIC_WORD 0xAABBCCDD // 身份验证识别码
+
+#pragma pack(push, 1) // 强制编译器 1 字节对齐，防止内存空洞导致文件错位
+typedef struct {
+    uint32_t magicWord;       // 4 Bytes: 魔数 (0xAABBCCDD)
+    uint8_t  version[4];      // 4 Bytes: 版本号 [主, 次, 修补, 内部]
+    uint32_t baudRate;        // 4 Bytes: 记录时的波特率
+    uint32_t createTimeMs;    // 4 Bytes: 文件创建时的系统开机时间(毫秒)
+    char     deviceName[16];  // 16 Bytes: 设备标识符
+    uint8_t  padding[HEADER_SIZE - 32]; // 224 Bytes: 预留空白占位符凑齐 256 字节
+} LogFileHeader_t;
+#pragma pack(pop)
 
 QueueHandle_t queueSD;
 QueueHandle_t queueWiFi;
-
 WiFiUDP udp;
-// U8G2_SH1106_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, /* clock=*/ I2C_SCL, /* data=*/ I2C_SDA, /* reset=*/ U8X8_PIN_NONE);
-// 换成 HW_I2C（硬件 I2C）
-U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 bool sdCardReady = false;
-uint32_t totalBytesWritten = 0; // 用于 OLED 显示写入量
+uint32_t totalBytesWritten = 0; 
+
+volatile bool requestSafeEject = false; 
+volatile bool isRecording = false;         
+volatile bool requestToggleRecord = false; 
 
 // ==========================================
-// 3. 任务 A：Wi-Fi UDP 发送 (跑在 Core 0)
+// 3. 任务 A：Wi-Fi UDP 发送 (Core 0)
 // ==========================================
 void TaskWiFiUpload(void *pvParameters) {
-  Serial.printf("🌐 TaskWiFi running on Core %d\n", xPortGetCoreID());
+  Serial.printf("TaskWiFi running on Core %d\n", xPortGetCoreID());
 
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     vTaskDelay(500 / portTICK_PERIOD_MS);
   }
-  Serial.println("✅ Wi-Fi Connected!");
+  Serial.println("Wi-Fi Connected!");
 
   LogChunk_t txChunk;
   for (;;) {
-    // 阻塞等待邮筒里的数据
     if (xQueueReceive(queueWiFi, &txChunk, portMAX_DELAY) == pdPASS) {
       udp.beginPacket(udpAddress, udpPort);
-      // 原汁原味直接发送字节流
       udp.write(txChunk.payload, txChunk.length);
       udp.endPacket();
     }
@@ -72,19 +92,18 @@ void TaskWiFiUpload(void *pvParameters) {
 }
 
 // ==========================================
-// 4. 任务 B：TF 卡记录与切割 (跑在 Core 1)
+// 4. 任务 B：TF 卡记录与热插拔 (Core 1)
 // ==========================================
 void TaskSDLog(void *pvParameters) {
-  Serial.printf("💾 TaskSD running on Core %d\n", xPortGetCoreID());
+  Serial.printf("TaskSD running on Core %d\n", xPortGetCoreID());
 
   File dataFile;
   char fileName[32];
   int fileIndex = 0;
   uint32_t currentFileSize = 0;
-  const uint32_t MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB 切割一次
+  const uint32_t MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB 自动切割
   uint32_t flushCounter = 0;
 
-  // 辅助函数：寻找下一个文件名并打开
   auto openNextFile = [&]() {
     if (dataFile) dataFile.close();
     while (true) {
@@ -94,36 +113,114 @@ void TaskSDLog(void *pvParameters) {
     }
     dataFile = SD.open(fileName, FILE_WRITE);
     currentFileSize = 0;
-    Serial.printf("📂 Opened new log: %s\n", fileName);
+    Serial.printf("Opened new log: %s\n", fileName);
+
+    // 🌟🌟🌟 核心动作：文件打开成功后，第一时间写入 256 字节表头 🌟🌟🌟
+    if (dataFile) {
+        LogFileHeader_t header = {0}; // 全部初始化为 0 (清空 Padding 区)
+        header.magicWord = MAGIC_WORD;
+        header.version[0] = 1; header.version[1] = 0; header.version[2] = 0; header.version[3] = 0; // v1.0.0.0
+        header.baudRate = UART_BAUD_RATE;
+        header.createTimeMs = millis();
+        strncpy(header.deviceName, "ESP32-S3-Logger", sizeof(header.deviceName) - 1);
+
+        // 将结构体强制转换为纯字节流写入 TF 卡
+        dataFile.write((const uint8_t*)&header, sizeof(LogFileHeader_t));
+        
+        currentFileSize += sizeof(LogFileHeader_t);
+        totalBytesWritten += sizeof(LogFileHeader_t);
+        Serial.println("System: 256-byte Metadata Header Written.");
+    }
   };
 
-  if (sdCardReady) {
-    openNextFile();
-  }
-
   LogChunk_t rxChunk;
+  uint32_t lastFlushTime = millis(); 
+  bool lastCdState = (digitalRead(SD_CD) == LOW); 
+
   for (;;) {
-    // 阻塞等待数据
-    if (xQueueReceive(queueSD, &rxChunk, portMAX_DELAY) == pdPASS) {
+    bool currentCdState = (digitalRead(SD_CD) == LOW);
+    if (currentCdState != lastCdState) {
+        vTaskDelay(500 / portTICK_PERIOD_MS); 
+        if (digitalRead(SD_CD) == (currentCdState ? LOW : HIGH)) {
+            if (currentCdState) { 
+                Serial.println("Hardware: SD Card Inserted!");
+                if (!sdCardReady) {
+                    SD.end(); 
+                    vTaskDelay(100 / portTICK_PERIOD_MS); 
+                    if (SD.begin(SD_CS, SPI, 10000000)) {
+                        sdCardReady = true;
+                        digitalWrite(LED_SYS, HIGH); 
+                        Serial.println("System: SD Card Remounted Successfully!");
+                    } else {
+                        sdCardReady = false;
+                        digitalWrite(LED_SYS, LOW);  
+                        Serial.println("System: SD Card Remount Failed!");
+                    }
+                }
+            } else { 
+                Serial.println("Hardware: SD Card Removed!");
+                if (sdCardReady) {
+                    if (dataFile) dataFile.close(); 
+                    SD.end(); 
+                    sdCardReady = false;
+                    isRecording = false; 
+                    digitalWrite(LED_SYS, LOW); 
+                    Serial.println("System: SD Card Unmounted by Hardware Pull.");
+                }
+            }
+            lastCdState = currentCdState;
+        }
+    }
+
+    if (requestSafeEject && sdCardReady) {
       if (dataFile) {
-        // 直接写入纯字节流
+        dataFile.flush();
+        dataFile.close();
+      }
+      SD.end(); 
+      sdCardReady = false;
+      isRecording = false; 
+      requestSafeEject = false; 
+      digitalWrite(LED_SYS, LOW); 
+      Serial.println("SD Card Safely Unmounted via HMI!");
+    }
+
+    if (requestToggleRecord && sdCardReady) {
+      requestToggleRecord = false;
+      if (isRecording) {
+        if (dataFile) {
+          dataFile.flush();
+          dataFile.close();
+        }
+        isRecording = false;
+        Serial.println("Recording STOPPED.");
+      } else {
+        openNextFile(); // <--- 重新启动记录时，会再次自动写入 256 字节表头
+        isRecording = true;
+        Serial.println("Recording STARTED.");
+      }
+    }
+    if (requestToggleRecord && !sdCardReady) requestToggleRecord = false;
+
+    if (xQueueReceive(queueSD, &rxChunk, 50 / portTICK_PERIOD_MS) == pdPASS) {
+      if (isRecording && dataFile && sdCardReady) {
         dataFile.write(rxChunk.payload, rxChunk.length);
-        
         currentFileSize += rxChunk.length;
         totalBytesWritten += rxChunk.length;
         flushCounter += rxChunk.length;
 
-        // 积攒约 50KB 强制落盘一次，避免频繁 flush 卡顿
-        if (flushCounter >= 50000) {
-          dataFile.flush();
-          flushCounter = 0;
-        }
-
-        // 文件大小达到 5MB 时自动切割
         if (currentFileSize >= MAX_FILE_SIZE) {
-          openNextFile();
+          openNextFile(); // <--- 5MB 自动切割文件时，也会在新文件开头写入表头
+          flushCounter = 0;
+          lastFlushTime = millis();
         }
       }
+    }
+
+    if (isRecording && dataFile && sdCardReady && (flushCounter >= 50000 || (millis() - lastFlushTime >= 2000 && flushCounter > 0))) {
+      dataFile.flush();
+      flushCounter = 0;
+      lastFlushTime = millis();
     }
   }
 }
@@ -133,17 +230,18 @@ void TaskSDLog(void *pvParameters) {
 // ==========================================
 void setup() {
   Serial.begin(115200);
+  Serial.setTxTimeoutMs(0);
   
-  // 🚨 终极防护：将硬件 RX 缓冲区开到 16KB，防止 OLED 刷新期间漏数据！
   Serial1.setRxBufferSize(16384);
-  Serial1.begin(921600, SERIAL_8N1, UART_RX, UART_TX);
+  Serial1.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX, UART_TX);
 
   pinMode(LED_SYS, OUTPUT);
   pinMode(LED_STAT, OUTPUT);
-  digitalWrite(LED_SYS, HIGH);
+  digitalWrite(LED_SYS, LOW);  
+  digitalWrite(LED_STAT, LOW); 
 
-  // 初始化 OLED
-  // 将硬件 I2C 的 SDA 绑定到 GPIO1，SCL 绑定到 GPIO2，并设置 400kHz 极速模式
+  pinMode(SD_CD, INPUT_PULLUP);
+
   Wire.begin(I2C_SDA, I2C_SCL, 400000); 
   u8g2.begin();
   u8g2.clearBuffer();
@@ -151,78 +249,64 @@ void setup() {
   u8g2.drawStr(5, 15, "System Booting...");
   u8g2.sendBuffer();
 
-  // 初始化 TF 卡
+  BSP_Button_Init();
+  App_HMI_Init();
+
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  if (!SD.begin(SD_CS, SPI, 10000000)) { // 降频到 10MHz 增加稳定性
-    Serial.println("SD Mount Failed!");
+  if (!SD.begin(SD_CS, SPI, 10000000)) { 
+    Serial.println("SD Mount Failed on Boot!");
     sdCardReady = false;
+    digitalWrite(LED_SYS, LOW); 
   } else {
-    Serial.println("SD Ready!");
+    Serial.println("SD Ready on Boot!");
     sdCardReady = true;
+    digitalWrite(LED_SYS, HIGH); 
   }
 
-  // 创建两个邮筒，每个邮筒最多装 20 个 Chunk (约 10KB 缓存)
-  queueSD = xQueueCreate(20, sizeof(LogChunk_t));
-  queueWiFi = xQueueCreate(20, sizeof(LogChunk_t));
+  queueSD = xQueueCreate(40, sizeof(LogChunk_t));
+  queueWiFi = xQueueCreate(40, sizeof(LogChunk_t));
 
-  // 启动双核任务
-  xTaskCreatePinnedToCore(TaskWiFiUpload, "TaskWiFi", 8192, NULL, 2, NULL, 0); // 绑定 Core 0
-  xTaskCreatePinnedToCore(TaskSDLog, "TaskSD", 8192, NULL, 2, NULL, 1);        // 绑定 Core 1
+  xTaskCreatePinnedToCore(TaskWiFiUpload, "TaskWiFi", 8192, NULL, 2, NULL, 0); 
+  xTaskCreatePinnedToCore(TaskSDLog, "TaskSD", 8192, NULL, 2, NULL, 1);        
 }
 
 // ==========================================
-// 6. 主循环 (高速搬运工 + 屏幕刷新)
+// 6. 主循环 (专职超高速 UART 搬运工)
 // ==========================================
+static LogChunk_t currentChunk = {0, {0}};
+static unsigned long lastReceiveTime = 0;
+
 void loop() {
   unsigned long currentMillis = millis();
   
-  // 1. 高速读取 UART 数据
-  size_t availableBytes = Serial1.available();
-  if (availableBytes > 0) {
-    LogChunk_t newChunk;
-    // 最多读取 CHUNK_SIZE (512字节)，如果有多少读多少
-    size_t bytesToRead = availableBytes < CHUNK_SIZE ? availableBytes : CHUNK_SIZE;
+  size_t avail = Serial1.available();
+  while (avail > 0) {
+    size_t spaceLeft = CHUNK_SIZE - currentChunk.length;
+    size_t bytesToRead = (avail < spaceLeft) ? avail : spaceLeft;
     
-    newChunk.length = Serial1.read(newChunk.payload, bytesToRead);
-    
-    if (newChunk.length > 0) {
-      // 0阻塞时间投入邮筒，若队列满则丢弃该包，保护系统不死机
-      xQueueSend(queueSD, &newChunk, 0);
-      xQueueSend(queueWiFi, &newChunk, 0);
-      
-      // 状态灯闪烁提示接收到数据
-      digitalWrite(LED_STAT, !digitalRead(LED_STAT));
+    size_t readCount = Serial1.read(currentChunk.payload + currentChunk.length, bytesToRead);
+    currentChunk.length += readCount;
+    lastReceiveTime = currentMillis;
+
+    if (currentChunk.length >= CHUNK_SIZE) {
+      xQueueSend(queueSD, &currentChunk, 5 / portTICK_PERIOD_MS);
+      if (WiFi.status() == WL_CONNECTED) {
+        xQueueSend(queueWiFi, &currentChunk, 0); 
+      }
+      currentChunk.length = 0; 
+      digitalWrite(LED_STAT, !digitalRead(LED_STAT)); 
     }
+    avail = Serial1.available(); 
   }
 
-  // 2. 定时刷新 OLED 屏幕 (每 1 秒刷新一次，避免频繁占用 CPU)
-  static unsigned long lastOledUpdate = 0;
-  if (currentMillis - lastOledUpdate >= 1000) {
-    lastOledUpdate = currentMillis;
-    
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_ncenB08_tr);
-    
-    // 显示 Wi-Fi 状态
-    if(WiFi.status() == WL_CONNECTED) u8g2.drawStr(5, 15, "WiFi: Connected");
-    else u8g2.drawStr(5, 15, "WiFi: Connecting...");
-    
-    // 显示 SD 卡与写入量
-    u8g2.setCursor(5, 35);
-    if(sdCardReady) {
-      u8g2.print("SD: OK  [");
-      u8g2.print(totalBytesWritten / 1024); // 显示已写入 KB 数
-      u8g2.print(" KB]");
-    } else {
-      u8g2.print("SD: FAULT");
+  if (currentChunk.length > 0 && (currentMillis - lastReceiveTime > 2)) {
+    xQueueSend(queueSD, &currentChunk, 5 / portTICK_PERIOD_MS);
+    if (WiFi.status() == WL_CONNECTED) {
+      xQueueSend(queueWiFi, &currentChunk, 0); 
     }
-
-    // 显示当前波特率标志
-    u8g2.drawStr(5, 55, "UART: 921600 bps");
-    
-    u8g2.sendBuffer(); // 耗时操作，已被底层 16KB RX Buffer 保护
+    currentChunk.length = 0;
+    digitalWrite(LED_STAT, !digitalRead(LED_STAT));
   }
 
-  // 短暂让出 CPU 给 FreeRTOS 调度器
   vTaskDelay(1 / portTICK_PERIOD_MS);
 }
