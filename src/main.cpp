@@ -15,7 +15,7 @@
 // ==========================================
 const char* ssid = "DDWW_Nwpu";           
 const char* password = "acq902m3";       
-const char* udpAddress = "192.168.0.103"; 
+const char* udpAddress = "192.168.0.112"; 
 const int udpPort = 6500;                 
 
 extern const uint32_t UART_BAUD_RATE = 115200; 

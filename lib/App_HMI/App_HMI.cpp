@@ -97,7 +97,7 @@ void DrawScreen() {
                     u8g2.print("Mode: STA (Connected)");
                     u8g2.setCursor(5, 43);
                     u8g2.print("IP: ");
-                    u8g2.print(WiFi.localIP().toString());
+                    u8g2.print(udpAddress);
                 } else {
                     u8g2.print("Mode: STA (Connecting)");
                     u8g2.setCursor(5, 43);
